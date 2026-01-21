@@ -1,0 +1,2048 @@
+/**
+ * NPC-Visuals-Editor.jsx
+ * Character Visual Editor for R-STRIKER RPG Dialogue System
+ * 
+ * Provides:
+ * - Image upload with transparency support for NPC portraits
+ * - Preview of all three dialogue modes (Fullscreen, Toast, Pilot HUD)
+ * - IndexedDB client-side storage during development
+ * - BAKE export to JSON manifest + ZIP with named images
+ * 
+ * @author R-STRIKER Development Team
+ * @version 1.0.0
+ */
+
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+
+// ============================================================================
+// NPC ROSTER CONFIGURATION (from Phase3 Spec)
+// ============================================================================
+
+const NPC_ROSTER = {
+  // Player Pilot
+  viper: {
+    id: 'viper',
+    name: 'Viper',
+    displayName: '"Viper" (Player Pilot)',
+    fullscreen: {
+      size: 512,
+      expressions: ['neutral', 'determined', 'shocked', 'injured', 'victorious', 'desperate']
+    },
+    toast: {
+      size: 48,
+      states: ['idle', 'talking', 'alarmed', 'damaged'],
+      framesPerState: { idle: 2, talking: 4, alarmed: 2, damaged: 2 }
+    },
+    hud: {
+      size: 64,
+      states: [
+        'idle_healthy', 'idle_wounded', 'idle_critical', 'idle_danger',
+        'look_left', 'look_right', 'firing_rockets', 'firing_gun',
+        'taking_damage', 'victory', 'defeat'
+      ],
+      framesPerState: {
+        idle_healthy: 2, idle_wounded: 2, idle_critical: 2, idle_danger: 2,
+        look_left: 1, look_right: 1, firing_rockets: 2, firing_gun: 2,
+        taking_damage: 3, victory: 4, defeat: 3
+      }
+    }
+  },
+  
+  // Mission Controller
+  command: {
+    id: 'command',
+    name: 'Command',
+    displayName: '"Command" (Mission Controller)',
+    fullscreen: {
+      size: 512,
+      expressions: ['neutral', 'concerned', 'urgent', 'relieved']
+    },
+    toast: {
+      size: 48,
+      states: ['idle', 'talking', 'urgent'],
+      framesPerState: { idle: 2, talking: 4, urgent: 2 }
+    },
+    hud: null // Command doesn't have HUD presence
+  },
+  
+  // Intelligence Officer
+  intel: {
+    id: 'intel',
+    name: 'Intel',
+    displayName: '"Intel" (Intelligence Officer)',
+    fullscreen: {
+      size: 512,
+      expressions: ['neutral', 'analytical', 'warning', 'excited']
+    },
+    toast: {
+      size: 48,
+      states: ['idle', 'talking'],
+      framesPerState: { idle: 2, talking: 4 }
+    },
+    hud: null
+  },
+  
+  // Generic Rescued Personnel
+  rescued: {
+    id: 'rescued',
+    name: 'Rescued',
+    displayName: '"Rescued" (Generic Personnel)',
+    fullscreen: {
+      size: 512,
+      expressions: ['grateful', 'panicked', 'relieved']
+    },
+    toast: {
+      size: 48,
+      states: ['talking', 'panicked'],
+      framesPerState: { talking: 4, panicked: 4 }
+    },
+    hud: null
+  },
+  
+  // Campaign Antagonist
+  enemy_commander: {
+    id: 'enemy_commander',
+    name: 'Enemy Commander',
+    displayName: '"Enemy Commander" (Antagonist)',
+    fullscreen: {
+      size: 512,
+      expressions: ['menacing', 'amused', 'enraged', 'defeated']
+    },
+    toast: {
+      size: 48,
+      states: ['talking', 'laughing'],
+      framesPerState: { talking: 4, laughing: 3 }
+    },
+    hud: null
+  },
+  
+  // Ground Team (Toast only)
+  ground_team: {
+    id: 'ground_team',
+    name: 'Ground Team',
+    displayName: '"Ground Team" (Rescued Personnel)',
+    fullscreen: null,
+    toast: {
+      size: 48,
+      states: ['talking', 'panicked'],
+      framesPerState: { talking: 4, panicked: 4 }
+    },
+    hud: null
+  },
+  
+  // Enemy (Toast only - intercepted transmissions)
+  enemy: {
+    id: 'enemy',
+    name: 'Enemy',
+    displayName: '"Enemy" (Intercepted Comms)',
+    fullscreen: null,
+    toast: {
+      size: 48,
+      states: ['talking', 'laughing'],
+      framesPerState: { talking: 4, laughing: 3 }
+    },
+    hud: null
+  }
+};
+
+// ============================================================================
+// INDEXED DB MANAGER
+// ============================================================================
+
+const DB_NAME = 'NPCVisualsEditor';
+const DB_VERSION = 1;
+const STORE_NAME = 'npc_images';
+
+class IndexedDBManager {
+  constructor() {
+    this.db = null;
+  }
+
+  async init() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
+      
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        this.db = request.result;
+        resolve(this.db);
+      };
+      
+      request.onupgradeneeded = (event) => {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        }
+      };
+    });
+  }
+
+  async saveImage(key, imageData, metadata = {}) {
+    return new Promise((resolve, reject) => {
+      const transaction = this.db.transaction([STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.put({
+        id: key,
+        imageData,
+        metadata,
+        timestamp: Date.now()
+      });
+      
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async getImage(key) {
+    return new Promise((resolve, reject) => {
+      const transaction = this.db.transaction([STORE_NAME], 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.get(key);
+      
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async getAllImages() {
+    return new Promise((resolve, reject) => {
+      const transaction = this.db.transaction([STORE_NAME], 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.getAll();
+      
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async deleteImage(key) {
+    return new Promise((resolve, reject) => {
+      const transaction = this.db.transaction([STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.delete(key);
+      
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async clearAll() {
+    return new Promise((resolve, reject) => {
+      const transaction = this.db.transaction([STORE_NAME], 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.clear();
+      
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+}
+
+const dbManager = new IndexedDBManager();
+
+// ============================================================================
+// ZIP GENERATION UTILITY
+// ============================================================================
+
+// Minimal ZIP implementation for browser
+class SimpleZip {
+  constructor() {
+    this.files = [];
+  }
+
+  addFile(name, data) {
+    this.files.push({ name, data });
+  }
+
+  // Convert base64 to Uint8Array
+  base64ToUint8Array(base64) {
+    const binaryString = atob(base64.split(',')[1] || base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  // CRC32 calculation
+  crc32(data) {
+    const table = [];
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let j = 0; j < 8; j++) {
+        c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      table[i] = c;
+    }
+    
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < data.length; i++) {
+      crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  // Generate ZIP blob
+  generate() {
+    const localHeaders = [];
+    const centralHeaders = [];
+    let offset = 0;
+
+    for (const file of this.files) {
+      const fileName = new TextEncoder().encode(file.name);
+      const fileData = typeof file.data === 'string' 
+        ? this.base64ToUint8Array(file.data)
+        : new TextEncoder().encode(JSON.stringify(file.data, null, 2));
+      
+      const crc = this.crc32(fileData);
+      
+      // Local file header
+      const localHeader = new Uint8Array(30 + fileName.length);
+      const view = new DataView(localHeader.buffer);
+      
+      view.setUint32(0, 0x04034b50, true); // Signature
+      view.setUint16(4, 20, true); // Version needed
+      view.setUint16(6, 0, true); // Flags
+      view.setUint16(8, 0, true); // Compression (store)
+      view.setUint16(10, 0, true); // Mod time
+      view.setUint16(12, 0, true); // Mod date
+      view.setUint32(14, crc, true); // CRC32
+      view.setUint32(18, fileData.length, true); // Compressed size
+      view.setUint32(22, fileData.length, true); // Uncompressed size
+      view.setUint16(26, fileName.length, true); // File name length
+      view.setUint16(28, 0, true); // Extra field length
+      localHeader.set(fileName, 30);
+
+      // Central directory header
+      const centralHeader = new Uint8Array(46 + fileName.length);
+      const centralView = new DataView(centralHeader.buffer);
+      
+      centralView.setUint32(0, 0x02014b50, true); // Signature
+      centralView.setUint16(4, 20, true); // Version made by
+      centralView.setUint16(6, 20, true); // Version needed
+      centralView.setUint16(8, 0, true); // Flags
+      centralView.setUint16(10, 0, true); // Compression
+      centralView.setUint16(12, 0, true); // Mod time
+      centralView.setUint16(14, 0, true); // Mod date
+      centralView.setUint32(16, crc, true); // CRC32
+      centralView.setUint32(20, fileData.length, true); // Compressed size
+      centralView.setUint32(24, fileData.length, true); // Uncompressed size
+      centralView.setUint16(28, fileName.length, true); // File name length
+      centralView.setUint16(30, 0, true); // Extra field length
+      centralView.setUint16(32, 0, true); // Comment length
+      centralView.setUint16(34, 0, true); // Disk number
+      centralView.setUint16(36, 0, true); // Internal attrs
+      centralView.setUint32(38, 0, true); // External attrs
+      centralView.setUint32(42, offset, true); // Offset
+      centralHeader.set(fileName, 46);
+
+      localHeaders.push({ header: localHeader, data: fileData });
+      centralHeaders.push(centralHeader);
+      offset += localHeader.length + fileData.length;
+    }
+
+    // End of central directory
+    const eocd = new Uint8Array(22);
+    const eocdView = new DataView(eocd.buffer);
+    const centralDirSize = centralHeaders.reduce((sum, h) => sum + h.length, 0);
+    
+    eocdView.setUint32(0, 0x06054b50, true); // Signature
+    eocdView.setUint16(4, 0, true); // Disk number
+    eocdView.setUint16(6, 0, true); // Central dir disk
+    eocdView.setUint16(8, this.files.length, true); // Entries on disk
+    eocdView.setUint16(10, this.files.length, true); // Total entries
+    eocdView.setUint32(12, centralDirSize, true); // Central dir size
+    eocdView.setUint32(16, offset, true); // Central dir offset
+    eocdView.setUint16(20, 0, true); // Comment length
+
+    // Combine all parts
+    const totalSize = offset + centralDirSize + 22;
+    const result = new Uint8Array(totalSize);
+    let pos = 0;
+
+    for (const { header, data } of localHeaders) {
+      result.set(header, pos);
+      pos += header.length;
+      result.set(data, pos);
+      pos += data.length;
+    }
+
+    for (const header of centralHeaders) {
+      result.set(header, pos);
+      pos += header.length;
+    }
+
+    result.set(eocd, pos);
+
+    return new Blob([result], { type: 'application/zip' });
+  }
+}
+
+// ============================================================================
+// STYLES
+// ============================================================================
+
+const editorStyles = `
+  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+  
+  :root {
+    --cyan-primary: #4a9eff;
+    --cyan-glow: rgba(74, 158, 255, 0.4);
+    --gold-primary: #ffd700;
+    --gold-glow: rgba(255, 215, 0, 0.4);
+    --orange-primary: #ff6b35;
+    --red-critical: #ff4444;
+    --bg-dark: #0a0a12;
+    --bg-panel: #0f0f1a;
+    --bg-card: #1a1a2e;
+    --bg-input: #12121f;
+    --text-primary: #ffffff;
+    --text-secondary: #8892a0;
+    --text-dim: #4a5568;
+    --border-color: #2a2a40;
+    --success-green: #00ff88;
+  }
+  
+  * {
+    box-sizing: border-box;
+  }
+  
+  .npc-editor {
+    min-height: 100vh;
+    background: var(--bg-dark);
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  
+  .editor-header {
+    background: linear-gradient(180deg, var(--bg-panel) 0%, var(--bg-dark) 100%);
+    border-bottom: 2px solid var(--cyan-primary);
+    padding: 20px 32px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 4px 30px var(--cyan-glow);
+  }
+  
+  .editor-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 28px;
+    font-weight: 900;
+    letter-spacing: 4px;
+    color: var(--cyan-primary);
+    text-shadow: 0 0 20px var(--cyan-glow);
+    margin: 0;
+  }
+  
+  .editor-subtitle {
+    font-size: 11px;
+    color: var(--text-secondary);
+    letter-spacing: 2px;
+    margin-top: 4px;
+  }
+  
+  .header-actions {
+    display: flex;
+    gap: 12px;
+  }
+  
+  .btn {
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 600;
+    font-size: 12px;
+    letter-spacing: 2px;
+    padding: 12px 24px;
+    border: 2px solid;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  
+  .btn-primary {
+    background: var(--cyan-primary);
+    border-color: var(--cyan-primary);
+    color: var(--bg-dark);
+  }
+  
+  .btn-primary:hover {
+    background: transparent;
+    color: var(--cyan-primary);
+    box-shadow: 0 0 20px var(--cyan-glow);
+  }
+  
+  .btn-gold {
+    background: var(--gold-primary);
+    border-color: var(--gold-primary);
+    color: var(--bg-dark);
+  }
+  
+  .btn-gold:hover {
+    background: transparent;
+    color: var(--gold-primary);
+    box-shadow: 0 0 20px var(--gold-glow);
+  }
+  
+  .btn-danger {
+    background: transparent;
+    border-color: var(--red-critical);
+    color: var(--red-critical);
+  }
+  
+  .btn-danger:hover {
+    background: var(--red-critical);
+    color: var(--bg-dark);
+  }
+  
+  .btn-ghost {
+    background: transparent;
+    border-color: var(--border-color);
+    color: var(--text-secondary);
+  }
+  
+  .btn-ghost:hover {
+    border-color: var(--cyan-primary);
+    color: var(--cyan-primary);
+  }
+  
+  .editor-layout {
+    display: grid;
+    grid-template-columns: 320px 1fr 400px;
+    gap: 0;
+    min-height: calc(100vh - 100px);
+  }
+  
+  .panel {
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border-color);
+    overflow-y: auto;
+  }
+  
+  .panel:last-child {
+    border-right: none;
+    border-left: 1px solid var(--border-color);
+  }
+  
+  .panel-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border-color);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 3px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    background: var(--bg-dark);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  
+  .npc-list {
+    padding: 8px;
+  }
+  
+  .npc-item {
+    padding: 14px 16px;
+    margin-bottom: 4px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: all 0.15s ease;
+  }
+  
+  .npc-item:hover {
+    background: var(--bg-card);
+    border-color: var(--border-color);
+  }
+  
+  .npc-item.active {
+    background: var(--bg-card);
+    border-color: var(--cyan-primary);
+    box-shadow: 0 0 15px rgba(74, 158, 255, 0.15);
+  }
+  
+  .npc-name {
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+  
+  .npc-meta {
+    font-size: 10px;
+    color: var(--text-dim);
+    display: flex;
+    gap: 12px;
+  }
+  
+  .npc-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  
+  .npc-badge.fullscreen { background: rgba(255, 215, 0, 0.15); color: var(--gold-primary); }
+  .npc-badge.toast { background: rgba(74, 158, 255, 0.15); color: var(--cyan-primary); }
+  .npc-badge.hud { background: rgba(255, 107, 53, 0.15); color: var(--orange-primary); }
+  
+  .preview-area {
+    background: var(--bg-dark);
+    display: flex;
+    flex-direction: column;
+  }
+  
+  .preview-tabs {
+    display: flex;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border-color);
+    padding: 0 16px;
+  }
+  
+  .preview-tab {
+    padding: 14px 24px;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 2px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s ease;
+    text-transform: uppercase;
+  }
+  
+  .preview-tab:hover {
+    color: var(--text-primary);
+  }
+  
+  .preview-tab.active {
+    color: var(--cyan-primary);
+    border-bottom-color: var(--cyan-primary);
+  }
+  
+  .preview-canvas {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+    position: relative;
+    background: 
+      radial-gradient(circle at 30% 40%, rgba(74, 158, 255, 0.03) 0%, transparent 50%),
+      radial-gradient(circle at 70% 60%, rgba(255, 215, 0, 0.02) 0%, transparent 50%),
+      repeating-linear-gradient(0deg, transparent, transparent 50px, rgba(74, 158, 255, 0.02) 50px, rgba(74, 158, 255, 0.02) 51px),
+      repeating-linear-gradient(90deg, transparent, transparent 50px, rgba(74, 158, 255, 0.02) 50px, rgba(74, 158, 255, 0.02) 51px);
+  }
+  
+  .preview-placeholder {
+    text-align: center;
+    color: var(--text-dim);
+  }
+  
+  .preview-placeholder-icon {
+    font-size: 64px;
+    margin-bottom: 16px;
+    opacity: 0.3;
+  }
+  
+  .preview-placeholder-text {
+    font-size: 12px;
+    letter-spacing: 2px;
+  }
+  
+  .editor-content {
+    padding: 20px;
+  }
+  
+  .section {
+    margin-bottom: 24px;
+  }
+  
+  .section-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-color);
+  }
+  
+  .asset-grid {
+    display: grid;
+    gap: 12px;
+  }
+  
+  .asset-slot {
+    background: var(--bg-input);
+    border: 2px dashed var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+    transition: all 0.15s ease;
+    cursor: pointer;
+  }
+  
+  .asset-slot:hover {
+    border-color: var(--cyan-primary);
+    background: rgba(74, 158, 255, 0.05);
+  }
+  
+  .asset-slot.has-image {
+    border-style: solid;
+    border-color: var(--success-green);
+  }
+  
+  .asset-slot-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  
+  .asset-slot-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: capitalize;
+  }
+  
+  .asset-slot-size {
+    font-size: 9px;
+    color: var(--text-dim);
+  }
+  
+  .asset-preview {
+    aspect-ratio: 1;
+    background: var(--bg-dark);
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    position: relative;
+  }
+  
+  .asset-preview img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    image-rendering: pixelated;
+  }
+  
+  .asset-preview-empty {
+    color: var(--text-dim);
+    font-size: 24px;
+  }
+  
+  .asset-slot-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  
+  .asset-btn {
+    flex: 1;
+    padding: 6px 8px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  
+  .asset-btn:hover {
+    border-color: var(--cyan-primary);
+    color: var(--cyan-primary);
+  }
+  
+  .asset-btn.delete:hover {
+    border-color: var(--red-critical);
+    color: var(--red-critical);
+  }
+  
+  /* Preview Components */
+  .fullscreen-preview {
+    position: relative;
+    width: 100%;
+    max-width: 900px;
+    aspect-ratio: 16/9;
+    background: linear-gradient(to top, rgba(0,0,0,0.8) 0%, rgba(0,0,0,0.4) 50%, transparent 100%);
+    border-radius: 12px;
+    overflow: hidden;
+    border: 2px solid var(--border-color);
+  }
+  
+  .fullscreen-character {
+    position: absolute;
+    bottom: 160px;
+    left: 5%;
+    max-width: 35%;
+    max-height: 65%;
+    filter: drop-shadow(0 0 30px rgba(0,0,0,0.8));
+  }
+  
+  .fullscreen-dialogue-box {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    width: 55%;
+    background: linear-gradient(145deg, rgba(15, 15, 30, 0.95) 0%, rgba(10, 10, 20, 0.98) 100%);
+    border: 4px solid var(--gold-primary);
+    border-radius: 16px;
+    padding: 24px 32px;
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.8;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.6), 0 0 30px var(--gold-glow);
+  }
+  
+  .fullscreen-name-tag {
+    position: absolute;
+    top: -16px;
+    left: 24px;
+    background: linear-gradient(145deg, var(--gold-primary), #ffaa00);
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--bg-dark);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    box-shadow: 0 4px 15px var(--gold-glow);
+  }
+  
+  .toast-preview {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    max-width: 420px;
+  }
+  
+  .toast-portrait-frame {
+    width: 96px;
+    height: 96px;
+    border: 4px solid var(--gold-primary);
+    border-radius: 8px;
+    background: linear-gradient(145deg, var(--bg-card) 0%, var(--bg-panel) 100%);
+    box-shadow: 0 0 20px var(--gold-glow), inset 0 0 10px rgba(0,0,0,0.5);
+    overflow: hidden;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  
+  .toast-portrait-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    image-rendering: pixelated;
+  }
+  
+  .toast-bubble {
+    background: linear-gradient(145deg, var(--bg-card) 0%, var(--bg-panel) 100%);
+    border: 3px solid var(--cyan-primary);
+    border-radius: 12px;
+    padding: 16px 20px;
+    color: var(--text-primary);
+    font-size: 11px;
+    line-height: 1.6;
+    box-shadow: 0 4px 20px var(--cyan-glow);
+    position: relative;
+    max-width: 300px;
+  }
+  
+  .toast-bubble-arrow {
+    position: absolute;
+    left: -12px;
+    bottom: 28px;
+    width: 0;
+    height: 0;
+    border-top: 10px solid transparent;
+    border-bottom: 10px solid transparent;
+    border-right: 12px solid var(--cyan-primary);
+  }
+  
+  .toast-name-tag {
+    position: absolute;
+    top: -12px;
+    left: 12px;
+    background: linear-gradient(145deg, var(--orange-primary), #e55a2b);
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    color: var(--text-primary);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  
+  .hud-preview {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+  
+  .hud-portrait-frame {
+    width: 128px;
+    height: 128px;
+    border: 3px solid var(--cyan-primary);
+    background: var(--bg-panel);
+    box-shadow: 
+      0 0 20px var(--cyan-glow),
+      inset 0 0 30px rgba(0,0,0,0.5);
+    overflow: hidden;
+    position: relative;
+  }
+  
+  .hud-portrait-frame::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.1) 2px,
+      rgba(0,0,0,0.1) 4px
+    );
+    pointer-events: none;
+    z-index: 1;
+  }
+  
+  .hud-portrait-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    image-rendering: pixelated;
+  }
+  
+  .hud-state-label {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    color: var(--cyan-primary);
+    text-transform: uppercase;
+  }
+  
+  .hud-state-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    max-width: 400px;
+    justify-content: center;
+  }
+  
+  .hud-state-btn {
+    padding: 6px 10px;
+    font-size: 8px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  
+  .hud-state-btn:hover, .hud-state-btn.active {
+    border-color: var(--cyan-primary);
+    color: var(--cyan-primary);
+    background: rgba(74, 158, 255, 0.1);
+  }
+  
+  /* Expression selector dropdown */
+  .expression-select {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    cursor: pointer;
+    margin-bottom: 16px;
+  }
+  
+  .expression-select:focus {
+    outline: none;
+    border-color: var(--cyan-primary);
+  }
+  
+  /* Statistics */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  
+  .stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+  }
+  
+  .stat-value {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--cyan-primary);
+    margin-bottom: 4px;
+  }
+  
+  .stat-label {
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  
+  /* Toast messages */
+  .toast-notification {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: var(--bg-card);
+    border: 2px solid var(--success-green);
+    border-radius: 8px;
+    padding: 16px 24px;
+    color: var(--text-primary);
+    font-size: 12px;
+    box-shadow: 0 4px 20px rgba(0, 255, 136, 0.2);
+    z-index: 1000;
+    animation: slideIn 0.3s ease;
+  }
+  
+  @keyframes slideIn {
+    from { transform: translateX(100px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+  }
+  
+  /* Frame strip for animation preview */
+  .frame-strip {
+    display: flex;
+    gap: 8px;
+    padding: 12px;
+    background: var(--bg-dark);
+    border-radius: 8px;
+    margin-top: 12px;
+    overflow-x: auto;
+  }
+  
+  .frame-item {
+    width: 48px;
+    height: 48px;
+    background: var(--bg-input);
+    border: 2px solid var(--border-color);
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    overflow: hidden;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  
+  .frame-item:hover {
+    border-color: var(--cyan-primary);
+  }
+  
+  .frame-item.active {
+    border-color: var(--gold-primary);
+    box-shadow: 0 0 10px var(--gold-glow);
+  }
+  
+  .frame-item img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    image-rendering: pixelated;
+  }
+  
+  .frame-number {
+    font-size: 9px;
+    color: var(--text-dim);
+  }
+  
+  /* Modal */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  
+  .modal {
+    background: var(--bg-panel);
+    border: 2px solid var(--cyan-primary);
+    border-radius: 12px;
+    padding: 32px;
+    max-width: 500px;
+    width: 90%;
+    box-shadow: 0 0 60px var(--cyan-glow);
+  }
+  
+  .modal-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--cyan-primary);
+    margin-bottom: 16px;
+  }
+  
+  .modal-text {
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.6;
+    margin-bottom: 24px;
+  }
+  
+  .modal-actions {
+    display: flex;
+    gap: 12px;
+    justify-content: flex-end;
+  }
+  
+  /* Hidden file input */
+  .hidden-input {
+    display: none;
+  }
+  
+  /* Progress bar */
+  .progress-bar {
+    width: 100%;
+    height: 8px;
+    background: var(--bg-input);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 12px 0;
+  }
+  
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--cyan-primary), var(--gold-primary));
+    transition: width 0.3s ease;
+  }
+  
+  /* Scrollbar styling */
+  .panel::-webkit-scrollbar {
+    width: 8px;
+  }
+  
+  .panel::-webkit-scrollbar-track {
+    background: var(--bg-dark);
+  }
+  
+  .panel::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 4px;
+  }
+  
+  .panel::-webkit-scrollbar-thumb:hover {
+    background: var(--text-dim);
+  }
+`;
+
+// ============================================================================
+// PLACEHOLDER SVG COMPONENTS
+// ============================================================================
+
+const PlaceholderPortrait = ({ size = 64, type = 'generic' }) => {
+  const colors = {
+    generic: { primary: '#4a9eff', secondary: '#1a1a2e' },
+    pilot: { primary: '#ff6b35', secondary: '#1a1a2e' },
+    command: { primary: '#ffd700', secondary: '#1a1a2e' },
+  };
+  
+  const { primary, secondary } = colors[type] || colors.generic;
+  
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64" fill="none">
+      <rect width="64" height="64" fill={secondary} />
+      <ellipse cx="32" cy="24" rx="12" ry="14" fill={primary} opacity="0.3" />
+      <ellipse cx="32" cy="56" rx="18" ry="16" fill={primary} opacity="0.3" />
+      <circle cx="27" cy="22" r="3" fill={primary} opacity="0.5" />
+      <circle cx="37" cy="22" r="3" fill={primary} opacity="0.5" />
+      <path d="M28 30 Q32 34 36 30" stroke={primary} strokeWidth="2" fill="none" opacity="0.5" />
+    </svg>
+  );
+};
+
+// ============================================================================
+// MAIN COMPONENT
+// ============================================================================
+
+const NPCVisualsEditor = () => {
+  // State
+  const [isDBReady, setIsDBReady] = useState(false);
+  const [selectedNPC, setSelectedNPC] = useState('viper');
+  const [previewMode, setPreviewMode] = useState('fullscreen');
+  const [images, setImages] = useState({});
+  const [notification, setNotification] = useState(null);
+  const [showClearModal, setShowClearModal] = useState(false);
+  const [selectedExpression, setSelectedExpression] = useState('neutral');
+  const [selectedToastState, setSelectedToastState] = useState('idle');
+  const [selectedHudState, setSelectedHudState] = useState('idle_healthy');
+  const [selectedFrame, setSelectedFrame] = useState(0);
+  const [isAnimating, setIsAnimating] = useState(false);
+  const fileInputRef = useRef(null);
+  const currentUploadTarget = useRef(null);
+  const animationRef = useRef(null);
+
+  // Initialize IndexedDB
+  useEffect(() => {
+    const initDB = async () => {
+      try {
+        await dbManager.init();
+        setIsDBReady(true);
+        await loadAllImages();
+      } catch (error) {
+        console.error('Failed to initialize IndexedDB:', error);
+        showNotification('Failed to initialize storage', 'error');
+      }
+    };
+    initDB();
+  }, []);
+
+  // Inject styles
+  useEffect(() => {
+    const styleEl = document.createElement('style');
+    styleEl.textContent = editorStyles;
+    document.head.appendChild(styleEl);
+    return () => styleEl.remove();
+  }, []);
+
+  // Animation loop for toast/hud previews
+  useEffect(() => {
+    if (!isAnimating) return;
+    
+    const npc = NPC_ROSTER[selectedNPC];
+    let frameCount = 2;
+    
+    if (previewMode === 'toast' && npc.toast) {
+      frameCount = npc.toast.framesPerState[selectedToastState] || 2;
+    } else if (previewMode === 'hud' && npc.hud) {
+      frameCount = npc.hud.framesPerState[selectedHudState] || 2;
+    }
+    
+    const interval = setInterval(() => {
+      setSelectedFrame(f => (f + 1) % frameCount);
+    }, 150);
+    
+    return () => clearInterval(interval);
+  }, [isAnimating, previewMode, selectedNPC, selectedToastState, selectedHudState]);
+
+  // Load all images from IndexedDB
+  const loadAllImages = async () => {
+    try {
+      const allImages = await dbManager.getAllImages();
+      const imageMap = {};
+      allImages.forEach(item => {
+        imageMap[item.id] = item.imageData;
+      });
+      setImages(imageMap);
+    } catch (error) {
+      console.error('Failed to load images:', error);
+    }
+  };
+
+  // Show notification
+  const showNotification = (message, type = 'success') => {
+    setNotification({ message, type });
+    setTimeout(() => setNotification(null), 3000);
+  };
+
+  // Generate image key
+  const getImageKey = (npcId, mode, state, frame = 0) => {
+    return `${npcId}_${mode}_${state}_${frame}`;
+  };
+
+  // Handle file upload
+  const handleFileUpload = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      showNotification('Please upload an image file', 'error');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const imageData = e.target.result;
+      const target = currentUploadTarget.current;
+      
+      if (target) {
+        const key = getImageKey(target.npcId, target.mode, target.state, target.frame);
+        await dbManager.saveImage(key, imageData, {
+          npcId: target.npcId,
+          mode: target.mode,
+          state: target.state,
+          frame: target.frame
+        });
+        
+        setImages(prev => ({ ...prev, [key]: imageData }));
+        showNotification(`Image uploaded for ${target.state}`);
+      }
+    };
+    reader.readAsDataURL(file);
+    event.target.value = '';
+  };
+
+  // Trigger file upload
+  const triggerUpload = (npcId, mode, state, frame = 0) => {
+    currentUploadTarget.current = { npcId, mode, state, frame };
+    fileInputRef.current?.click();
+  };
+
+  // Delete image
+  const deleteImage = async (npcId, mode, state, frame = 0) => {
+    const key = getImageKey(npcId, mode, state, frame);
+    await dbManager.deleteImage(key);
+    setImages(prev => {
+      const updated = { ...prev };
+      delete updated[key];
+      return updated;
+    });
+    showNotification('Image removed');
+  };
+
+  // Clear all data
+  const clearAllData = async () => {
+    await dbManager.clearAll();
+    setImages({});
+    setShowClearModal(false);
+    showNotification('All data cleared');
+  };
+
+  // Calculate statistics
+  const calculateStats = () => {
+    let totalSlots = 0;
+    let filledSlots = 0;
+
+    Object.values(NPC_ROSTER).forEach(npc => {
+      if (npc.fullscreen) {
+        npc.fullscreen.expressions.forEach(expr => {
+          totalSlots++;
+          if (images[getImageKey(npc.id, 'fullscreen', expr)]) filledSlots++;
+        });
+      }
+      if (npc.toast) {
+        npc.toast.states.forEach(state => {
+          const frames = npc.toast.framesPerState[state] || 2;
+          for (let i = 0; i < frames; i++) {
+            totalSlots++;
+            if (images[getImageKey(npc.id, 'toast', state, i)]) filledSlots++;
+          }
+        });
+      }
+      if (npc.hud) {
+        npc.hud.states.forEach(state => {
+          const frames = npc.hud.framesPerState[state] || 2;
+          for (let i = 0; i < frames; i++) {
+            totalSlots++;
+            if (images[getImageKey(npc.id, 'hud', state, i)]) filledSlots++;
+          }
+        });
+      }
+    });
+
+    return { totalSlots, filledSlots, percentage: Math.round((filledSlots / totalSlots) * 100) };
+  };
+
+  // Export to JSON
+  const exportToJSON = () => {
+    const manifest = {
+      version: '1.0.0',
+      generatedAt: new Date().toISOString(),
+      characters: {}
+    };
+
+    Object.values(NPC_ROSTER).forEach(npc => {
+      const charData = {
+        id: npc.id,
+        name: npc.name,
+        displayName: npc.displayName,
+        assets: {
+          fullscreen: null,
+          toast: null,
+          hud: null
+        }
+      };
+
+      if (npc.fullscreen) {
+        charData.assets.fullscreen = {
+          size: npc.fullscreen.size,
+          expressions: {}
+        };
+        npc.fullscreen.expressions.forEach(expr => {
+          const key = getImageKey(npc.id, 'fullscreen', expr);
+          if (images[key]) {
+            charData.assets.fullscreen.expressions[expr] = `portraits/${npc.id}_fullscreen_${expr}.png`;
+          }
+        });
+      }
+
+      if (npc.toast) {
+        charData.assets.toast = {
+          size: npc.toast.size,
+          states: {}
+        };
+        npc.toast.states.forEach(state => {
+          const frames = [];
+          const frameCount = npc.toast.framesPerState[state] || 2;
+          for (let i = 0; i < frameCount; i++) {
+            const key = getImageKey(npc.id, 'toast', state, i);
+            if (images[key]) {
+              frames.push(`sprites/${npc.id}_toast_${state}_${i}.png`);
+            }
+          }
+          if (frames.length > 0) {
+            charData.assets.toast.states[state] = frames;
+          }
+        });
+      }
+
+      if (npc.hud) {
+        charData.assets.hud = {
+          size: npc.hud.size,
+          states: {}
+        };
+        npc.hud.states.forEach(state => {
+          const frames = [];
+          const frameCount = npc.hud.framesPerState[state] || 2;
+          for (let i = 0; i < frameCount; i++) {
+            const key = getImageKey(npc.id, 'hud', state, i);
+            if (images[key]) {
+              frames.push(`hud/${npc.id}_hud_${state}_${i}.png`);
+            }
+          }
+          if (frames.length > 0) {
+            charData.assets.hud.states[state] = frames;
+          }
+        });
+      }
+
+      manifest.characters[npc.id] = charData;
+    });
+
+    const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'npc-manifest.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    showNotification('Manifest exported');
+  };
+
+  // BAKE - Create ZIP with all assets
+  const bakeAssets = async () => {
+    const zip = new SimpleZip();
+    const manifest = {
+      version: '1.0.0',
+      generatedAt: new Date().toISOString(),
+      characters: {}
+    };
+
+    Object.values(NPC_ROSTER).forEach(npc => {
+      const charData = {
+        id: npc.id,
+        name: npc.name,
+        displayName: npc.displayName,
+        assets: {
+          fullscreen: null,
+          toast: null,
+          hud: null
+        }
+      };
+
+      // Fullscreen portraits
+      if (npc.fullscreen) {
+        charData.assets.fullscreen = {
+          size: npc.fullscreen.size,
+          expressions: {}
+        };
+        npc.fullscreen.expressions.forEach(expr => {
+          const key = getImageKey(npc.id, 'fullscreen', expr);
+          if (images[key]) {
+            const filename = `portraits/${npc.id}_fullscreen_${expr}.png`;
+            charData.assets.fullscreen.expressions[expr] = filename;
+            zip.addFile(filename, images[key]);
+          }
+        });
+      }
+
+      // Toast sprites
+      if (npc.toast) {
+        charData.assets.toast = {
+          size: npc.toast.size,
+          states: {}
+        };
+        npc.toast.states.forEach(state => {
+          const frames = [];
+          const frameCount = npc.toast.framesPerState[state] || 2;
+          for (let i = 0; i < frameCount; i++) {
+            const key = getImageKey(npc.id, 'toast', state, i);
+            if (images[key]) {
+              const filename = `sprites/${npc.id}_toast_${state}_${i}.png`;
+              frames.push(filename);
+              zip.addFile(filename, images[key]);
+            }
+          }
+          if (frames.length > 0) {
+            charData.assets.toast.states[state] = frames;
+          }
+        });
+      }
+
+      // HUD sprites
+      if (npc.hud) {
+        charData.assets.hud = {
+          size: npc.hud.size,
+          states: {}
+        };
+        npc.hud.states.forEach(state => {
+          const frames = [];
+          const frameCount = npc.hud.framesPerState[state] || 2;
+          for (let i = 0; i < frameCount; i++) {
+            const key = getImageKey(npc.id, 'hud', state, i);
+            if (images[key]) {
+              const filename = `hud/${npc.id}_hud_${state}_${i}.png`;
+              frames.push(filename);
+              zip.addFile(filename, images[key]);
+            }
+          }
+          if (frames.length > 0) {
+            charData.assets.hud.states[state] = frames;
+          }
+        });
+      }
+
+      manifest.characters[npc.id] = charData;
+    });
+
+    // Add manifest to ZIP
+    zip.addFile('npc-manifest.json', manifest);
+
+    // Generate and download
+    const blob = zip.generate();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'npc-textures.zip';
+    a.click();
+    URL.revokeObjectURL(url);
+    showNotification('Assets baked and downloaded!');
+  };
+
+  // Get current NPC
+  const currentNPC = NPC_ROSTER[selectedNPC];
+  const stats = calculateStats();
+
+  // Render asset slots for the current mode
+  const renderAssetSlots = () => {
+    if (previewMode === 'fullscreen' && currentNPC.fullscreen) {
+      return currentNPC.fullscreen.expressions.map(expr => {
+        const key = getImageKey(currentNPC.id, 'fullscreen', expr);
+        const hasImage = !!images[key];
+        
+        return (
+          <div 
+            key={expr} 
+            className={`asset-slot ${hasImage ? 'has-image' : ''}`}
+            onClick={() => !hasImage && triggerUpload(currentNPC.id, 'fullscreen', expr)}
+          >
+            <div className="asset-slot-header">
+              <span className="asset-slot-label">{expr}</span>
+              <span className="asset-slot-size">{currentNPC.fullscreen.size}×{currentNPC.fullscreen.size}</span>
+            </div>
+            <div className="asset-preview">
+              {hasImage ? (
+                <img src={images[key]} alt={expr} />
+              ) : (
+                <div className="asset-preview-empty">
+                  <PlaceholderPortrait size={64} />
+                </div>
+              )}
+            </div>
+            <div className="asset-slot-actions">
+              <button className="asset-btn" onClick={(e) => { e.stopPropagation(); triggerUpload(currentNPC.id, 'fullscreen', expr); }}>
+                {hasImage ? 'Replace' : 'Upload'}
+              </button>
+              {hasImage && (
+                <button className="asset-btn delete" onClick={(e) => { e.stopPropagation(); deleteImage(currentNPC.id, 'fullscreen', expr); }}>
+                  Delete
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      });
+    }
+
+    if (previewMode === 'toast' && currentNPC.toast) {
+      return currentNPC.toast.states.map(state => {
+        const frameCount = currentNPC.toast.framesPerState[state] || 2;
+        const frames = [];
+        for (let i = 0; i < frameCount; i++) {
+          frames.push(getImageKey(currentNPC.id, 'toast', state, i));
+        }
+        const filledFrames = frames.filter(k => images[k]).length;
+        
+        return (
+          <div key={state} className="asset-slot">
+            <div className="asset-slot-header">
+              <span className="asset-slot-label">{state} ({filledFrames}/{frameCount} frames)</span>
+              <span className="asset-slot-size">{currentNPC.toast.size}×{currentNPC.toast.size}</span>
+            </div>
+            <div className="frame-strip">
+              {frames.map((key, idx) => (
+                <div 
+                  key={idx}
+                  className={`frame-item ${selectedToastState === state && selectedFrame === idx ? 'active' : ''}`}
+                  onClick={() => {
+                    setSelectedToastState(state);
+                    setSelectedFrame(idx);
+                    if (!images[key]) {
+                      triggerUpload(currentNPC.id, 'toast', state, idx);
+                    }
+                  }}
+                >
+                  {images[key] ? (
+                    <img src={images[key]} alt={`Frame ${idx}`} />
+                  ) : (
+                    <span className="frame-number">{idx + 1}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="asset-slot-actions">
+              <button className="asset-btn" onClick={() => triggerUpload(currentNPC.id, 'toast', state, selectedFrame)}>
+                Upload Frame
+              </button>
+              {images[getImageKey(currentNPC.id, 'toast', state, selectedFrame)] && (
+                <button className="asset-btn delete" onClick={() => deleteImage(currentNPC.id, 'toast', state, selectedFrame)}>
+                  Delete Frame
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      });
+    }
+
+    if (previewMode === 'hud' && currentNPC.hud) {
+      return currentNPC.hud.states.map(state => {
+        const frameCount = currentNPC.hud.framesPerState[state] || 2;
+        const frames = [];
+        for (let i = 0; i < frameCount; i++) {
+          frames.push(getImageKey(currentNPC.id, 'hud', state, i));
+        }
+        const filledFrames = frames.filter(k => images[k]).length;
+        
+        return (
+          <div key={state} className="asset-slot">
+            <div className="asset-slot-header">
+              <span className="asset-slot-label">{state.replace(/_/g, ' ')} ({filledFrames}/{frameCount})</span>
+              <span className="asset-slot-size">{currentNPC.hud.size}×{currentNPC.hud.size}</span>
+            </div>
+            <div className="frame-strip">
+              {frames.map((key, idx) => (
+                <div 
+                  key={idx}
+                  className={`frame-item ${selectedHudState === state && selectedFrame === idx ? 'active' : ''}`}
+                  onClick={() => {
+                    setSelectedHudState(state);
+                    setSelectedFrame(idx);
+                    if (!images[key]) {
+                      triggerUpload(currentNPC.id, 'hud', state, idx);
+                    }
+                  }}
+                >
+                  {images[key] ? (
+                    <img src={images[key]} alt={`Frame ${idx}`} />
+                  ) : (
+                    <span className="frame-number">{idx + 1}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="asset-slot-actions">
+              <button className="asset-btn" onClick={() => triggerUpload(currentNPC.id, 'hud', state, selectedFrame)}>
+                Upload Frame
+              </button>
+              {images[getImageKey(currentNPC.id, 'hud', state, selectedFrame)] && (
+                <button className="asset-btn delete" onClick={() => deleteImage(currentNPC.id, 'hud', state, selectedFrame)}>
+                  Delete Frame
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      });
+    }
+
+    return (
+      <div className="preview-placeholder">
+        <div className="preview-placeholder-icon">⚠️</div>
+        <div className="preview-placeholder-text">
+          {currentNPC.name} doesn't have {previewMode} assets
+        </div>
+      </div>
+    );
+  };
+
+  // Render preview
+  const renderPreview = () => {
+    if (previewMode === 'fullscreen') {
+      const key = getImageKey(currentNPC.id, 'fullscreen', selectedExpression);
+      const imageUrl = images[key];
+      
+      return (
+        <div className="fullscreen-preview">
+          {imageUrl && (
+            <img 
+              src={imageUrl} 
+              alt={currentNPC.name} 
+              className="fullscreen-character"
+            />
+          )}
+          {!imageUrl && (
+            <div className="fullscreen-character" style={{ opacity: 0.3 }}>
+              <PlaceholderPortrait size={256} type="generic" />
+            </div>
+          )}
+          <div className="fullscreen-dialogue-box">
+            <div className="fullscreen-name-tag">{currentNPC.name}</div>
+            <p>
+              "This is a preview of the fullscreen dialogue mode. The character portrait 
+              appears on the left while dialogue text displays here in this box."
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    if (previewMode === 'toast') {
+      const key = getImageKey(currentNPC.id, 'toast', selectedToastState, selectedFrame);
+      const imageUrl = images[key];
+      
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 24 }}>
+          <div className="toast-preview">
+            <div className="toast-portrait-frame">
+              {imageUrl ? (
+                <img src={imageUrl} alt={currentNPC.name} />
+              ) : (
+                <PlaceholderPortrait size={96} type="generic" />
+              )}
+            </div>
+            <div className="toast-bubble">
+              <div className="toast-bubble-arrow" />
+              <div className="toast-name-tag">{currentNPC.name}</div>
+              <p style={{ margin: 0 }}>
+                This is a toast message preview! Animation state: {selectedToastState}
+              </p>
+            </div>
+          </div>
+          <button 
+            className={`btn ${isAnimating ? 'btn-gold' : 'btn-ghost'}`}
+            onClick={() => setIsAnimating(!isAnimating)}
+          >
+            {isAnimating ? '⏸ Stop Animation' : '▶ Play Animation'}
+          </button>
+        </div>
+      );
+    }
+
+    if (previewMode === 'hud') {
+      const key = getImageKey(currentNPC.id, 'hud', selectedHudState, selectedFrame);
+      const imageUrl = images[key];
+      
+      return (
+        <div className="hud-preview">
+          <div className="hud-portrait-frame">
+            {imageUrl ? (
+              <img src={imageUrl} alt={currentNPC.name} />
+            ) : (
+              <PlaceholderPortrait size={128} type="pilot" />
+            )}
+          </div>
+          <div className="hud-state-label">{selectedHudState.replace(/_/g, ' ')}</div>
+          
+          {currentNPC.hud && (
+            <div className="hud-state-buttons">
+              {currentNPC.hud.states.map(state => (
+                <button
+                  key={state}
+                  className={`hud-state-btn ${selectedHudState === state ? 'active' : ''}`}
+                  onClick={() => {
+                    setSelectedHudState(state);
+                    setSelectedFrame(0);
+                  }}
+                >
+                  {state.replace(/_/g, ' ')}
+                </button>
+              ))}
+            </div>
+          )}
+          
+          <button 
+            className={`btn ${isAnimating ? 'btn-gold' : 'btn-ghost'}`}
+            onClick={() => setIsAnimating(!isAnimating)}
+          >
+            {isAnimating ? '⏸ Stop Animation' : '▶ Play Animation'}
+          </button>
+        </div>
+      );
+    }
+
+    return null;
+  };
+
+  // Determine available preview modes for current NPC
+  const getAvailableModes = () => {
+    const modes = [];
+    if (currentNPC.fullscreen) modes.push('fullscreen');
+    if (currentNPC.toast) modes.push('toast');
+    if (currentNPC.hud) modes.push('hud');
+    return modes;
+  };
+
+  // Switch to first available mode if current is unavailable
+  useEffect(() => {
+    const availableModes = getAvailableModes();
+    if (!availableModes.includes(previewMode) && availableModes.length > 0) {
+      setPreviewMode(availableModes[0]);
+    }
+    
+    // Reset expression/state selections
+    if (currentNPC.fullscreen) {
+      setSelectedExpression(currentNPC.fullscreen.expressions[0]);
+    }
+    if (currentNPC.toast) {
+      setSelectedToastState(currentNPC.toast.states[0]);
+    }
+    if (currentNPC.hud) {
+      setSelectedHudState(currentNPC.hud.states[0]);
+    }
+    setSelectedFrame(0);
+  }, [selectedNPC]);
+
+  if (!isDBReady) {
+    return (
+      <div className="npc-editor" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ fontSize: 48, marginBottom: 16 }}>⚡</div>
+          <div style={{ fontFamily: 'Orbitron', letterSpacing: 2 }}>INITIALIZING...</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="npc-editor">
+      {/* Hidden file input */}
+      <input 
+        ref={fileInputRef}
+        type="file"
+        accept="image/png,image/webp,image/gif"
+        onChange={handleFileUpload}
+        className="hidden-input"
+      />
+      
+      {/* Header */}
+      <header className="editor-header">
+        <div>
+          <h1 className="editor-title">NPC VISUALS EDITOR</h1>
+          <p className="editor-subtitle">R-STRIKER Character Asset Manager</p>
+        </div>
+        <div className="header-actions">
+          <button className="btn btn-ghost" onClick={exportToJSON}>
+            📄 Export JSON
+          </button>
+          <button className="btn btn-gold" onClick={bakeAssets}>
+            🔥 BAKE
+          </button>
+          <button className="btn btn-danger" onClick={() => setShowClearModal(true)}>
+            🗑️ Clear All
+          </button>
+        </div>
+      </header>
+
+      {/* Main Layout */}
+      <div className="editor-layout">
+        {/* Left Panel - NPC List */}
+        <div className="panel">
+          <div className="panel-header">Characters</div>
+          
+          {/* Stats */}
+          <div style={{ padding: 16 }}>
+            <div className="stats-grid">
+              <div className="stat-card">
+                <div className="stat-value">{stats.filledSlots}</div>
+                <div className="stat-label">Uploaded</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-value">{stats.totalSlots}</div>
+                <div className="stat-label">Total Slots</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-value">{stats.percentage}%</div>
+                <div className="stat-label">Complete</div>
+              </div>
+            </div>
+            <div className="progress-bar">
+              <div className="progress-fill" style={{ width: `${stats.percentage}%` }} />
+            </div>
+          </div>
+          
+          <div className="npc-list">
+            {Object.values(NPC_ROSTER).map(npc => (
+              <div
+                key={npc.id}
+                className={`npc-item ${selectedNPC === npc.id ? 'active' : ''}`}
+                onClick={() => setSelectedNPC(npc.id)}
+              >
+                <div className="npc-name">{npc.name}</div>
+                <div className="npc-meta">
+                  {npc.fullscreen && <span className="npc-badge fullscreen">FS</span>}
+                  {npc.toast && <span className="npc-badge toast">Toast</span>}
+                  {npc.hud && <span className="npc-badge hud">HUD</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Center - Preview Area */}
+        <div className="preview-area">
+          <div className="preview-tabs">
+            {getAvailableModes().map(mode => (
+              <div
+                key={mode}
+                className={`preview-tab ${previewMode === mode ? 'active' : ''}`}
+                onClick={() => {
+                  setPreviewMode(mode);
+                  setSelectedFrame(0);
+                  setIsAnimating(false);
+                }}
+              >
+                {mode === 'fullscreen' && '🖼️ Fullscreen'}
+                {mode === 'toast' && '💬 Toast'}
+                {mode === 'hud' && '🎮 Pilot HUD'}
+              </div>
+            ))}
+          </div>
+          
+          {/* Expression/State selector for fullscreen */}
+          {previewMode === 'fullscreen' && currentNPC.fullscreen && (
+            <div style={{ padding: '12px 24px', background: 'var(--bg-panel)', borderBottom: '1px solid var(--border-color)' }}>
+              <select 
+                className="expression-select"
+                value={selectedExpression}
+                onChange={(e) => setSelectedExpression(e.target.value)}
+                style={{ margin: 0 }}
+              >
+                {currentNPC.fullscreen.expressions.map(expr => (
+                  <option key={expr} value={expr}>
+                    Expression: {expr}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          
+          <div className="preview-canvas">
+            {getAvailableModes().length > 0 ? (
+              renderPreview()
+            ) : (
+              <div className="preview-placeholder">
+                <div className="preview-placeholder-icon">📷</div>
+                <div className="preview-placeholder-text">
+                  No preview modes available for this character
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right Panel - Asset Slots */}
+        <div className="panel">
+          <div className="panel-header">
+            {currentNPC.name} — {previewMode} Assets
+          </div>
+          <div className="editor-content">
+            <div className="asset-grid">
+              {renderAssetSlots()}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Notification Toast */}
+      {notification && (
+        <div className="toast-notification" style={{
+          borderColor: notification.type === 'error' ? 'var(--red-critical)' : 'var(--success-green)'
+        }}>
+          {notification.message}
+        </div>
+      )}
+
+      {/* Clear Confirmation Modal */}
+      {showClearModal && (
+        <div className="modal-overlay" onClick={() => setShowClearModal(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <h2 className="modal-title">⚠️ Clear All Data?</h2>
+            <p className="modal-text">
+              This will permanently delete all uploaded images from IndexedDB. 
+              This action cannot be undone. Make sure you've exported or baked 
+              your assets first!
+            </p>
+            <div className="modal-actions">
+              <button className="btn btn-ghost" onClick={() => setShowClearModal(false)}>
+                Cancel
+              </button>
+              <button className="btn btn-danger" onClick={clearAllData}>
+                Clear Everything
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default NPCVisualsEditor;
